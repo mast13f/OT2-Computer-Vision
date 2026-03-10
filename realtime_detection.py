@@ -44,34 +44,113 @@ def load_model(checkpoint_path):
     return model
 
 
+def compute_iou(box_a, box_b):
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    xa = max(box_a[0], box_b[0])
+    ya = max(box_a[1], box_b[1])
+    xb = min(box_a[2], box_b[2])
+    yb = min(box_a[3], box_b[3])
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+
+def match_liquid_to_tips(tip_boxes, liquid_boxes):
+    """Match each liquid box to its enclosing/overlapping tip box.
+    Returns a dict: tip_index -> liquid_box (best match)."""
+    matches = {}
+    for liq_box in liquid_boxes:
+        best_idx = -1
+        best_iou = 0
+        for i, tip_box in enumerate(tip_boxes):
+            iou = compute_iou(tip_box, liq_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = i
+        if best_idx >= 0 and best_iou > 0.05:
+            matches[best_idx] = liq_box
+    return matches
+
+
 def draw_detections(frame, pred, conf_threshold):
-    """Draw bounding boxes and labels on the frame. Returns annotated frame and counts."""
+    """Draw bounding boxes, labels, and liquid % on the frame."""
     bboxes = pred.prediction.bboxes_xyxy
     confidences = pred.prediction.confidence
     labels = pred.prediction.labels
 
+    # Separate tips and liquids
+    tip_boxes = []
+    liquid_boxes = []
     tip_count = 0
     liquid_count = 0
 
     for bbox, conf, label in zip(bboxes, confidences, labels):
         if conf < conf_threshold:
             continue
-
+        coords = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
         class_name = CLASSES[int(label)]
-        color = COLORS[class_name]
-
         if class_name == "Tip":
+            tip_boxes.append(coords)
             tip_count += 1
         else:
+            liquid_boxes.append(coords)
             liquid_count += 1
 
-        x1, y1, x2, y2 = map(int, bbox)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    # Sort tips left-to-right by x center for consistent numbering
+    tip_boxes.sort(key=lambda b: (b[0] + b[2]) / 2)
 
-        text = f"{class_name} {conf:.2f}"
-        ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        cv2.rectangle(frame, (x1, y1 - ts[1] - 6), (x1 + ts[0], y1), color, -1)
-        cv2.putText(frame, text, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    # Match liquid boxes to their corresponding tips
+    liquid_matches = match_liquid_to_tips(tip_boxes, liquid_boxes)
+
+    # Draw tip boxes with liquid percentage
+    for i, tb in enumerate(tip_boxes):
+        x1, y1, x2, y2 = map(int, tb)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), COLORS["Tip"], 2)
+
+        tip_height = tb[3] - tb[1]
+        if i in liquid_matches:
+            lb = liquid_matches[i]
+            liq_height = lb[3] - lb[1]
+            pct = (liq_height / tip_height * 100) if tip_height > 0 else 0
+            pct = min(pct, 100.0)
+
+            # Draw liquid box
+            lx1, ly1, lx2, ly2 = map(int, lb)
+            cv2.rectangle(frame, (lx1, ly1), (lx2, ly2), COLORS["Liquid"], 2)
+
+            # Label: "Tip #N  |  XX% liquid"
+            text = f"Tip {i+1}: {pct:.0f}%"
+            color = COLORS["Liquid"]
+        else:
+            text = f"Tip {i+1}: Empty"
+            pct = 0
+            color = COLORS["Tip"]
+
+        # Draw label above tip box
+        ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+        cv2.rectangle(frame, (x1, y1 - ts[1] - 8), (x1 + ts[0] + 4, y1), color, -1)
+        cv2.putText(frame, text, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+        # Draw a small fill bar on the left edge of the tip box
+        bar_x = x1 - 12
+        bar_w = 8
+        bar_top = y1
+        bar_bot = y2
+        bar_h = bar_bot - bar_top
+        fill_h = int(bar_h * pct / 100)
+        cv2.rectangle(frame, (bar_x, bar_top), (bar_x + bar_w, bar_bot), (100, 100, 100), 1)
+        if fill_h > 0:
+            cv2.rectangle(frame, (bar_x, bar_bot - fill_h), (bar_x + bar_w, bar_bot), COLORS["Liquid"], -1)
+
+    # Draw any unmatched liquid boxes
+    matched_liquids = set(id(liquid_matches[k]) for k in liquid_matches) if liquid_matches else set()
+    for lb in liquid_boxes:
+        if id(lb) not in matched_liquids:
+            lx1, ly1, lx2, ly2 = map(int, lb)
+            cv2.rectangle(frame, (lx1, ly1), (lx2, ly2), COLORS["Liquid"], 2)
+            cv2.putText(frame, "Liquid", (lx1, ly1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS["Liquid"], 1)
 
     return frame, tip_count, liquid_count
 
